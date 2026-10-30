@@ -1,0 +1,11 @@
+{
+  "spreadsheet_url": "https://docs.google.com/spreadsheets/d/1_SLnTTen9TJPdMjKD78Pqdh4AzhrBxwVnEjWPTbgPbg/edit#gid=0",
+  "credentials_file": "credentials.json",
+  "header_row": 1,
+  "columns": {
+    "number": 1,
+    "title": 2,
+    "notes": 3,
+    "url": 4
+  }
+}

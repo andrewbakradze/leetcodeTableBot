@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leetcode-table-bot"
+version = "1.0.0"
+description = "Консольный дневник задач LeetCode в Google Таблицах"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["gspread>=6.1.4,<7", "rich>=13.9,<15", "requests>=2.31,<3"]
+
+[project.scripts]
+leetcode-table-bot = "leetcode_table_bot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["leetcode_table_bot*"]
