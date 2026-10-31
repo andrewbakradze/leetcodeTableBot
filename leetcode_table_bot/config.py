@@ -10,9 +10,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-FIELDS = ("number", "title", "notes", "url")
-DEFAULT_HEADERS = ["problem number", "problem name", "my difficulties", "link"]
-DEFAULT_COLUMNS = dict(zip(FIELDS, range(1, 5)))
+FIELDS = ("number", "title", "notes", "url", "resolve")
+DEFAULT_HEADERS = ["problem number", "problem name", "my difficulties", "link", "Resolve"]
+DEFAULT_COLUMNS = dict(zip(FIELDS, range(1, len(FIELDS) + 1)))
+RESOLVE_OPTIONS = ("ДА", "может быть", "нет")
 
 
 class BotError(Exception):
@@ -38,11 +39,12 @@ def parse_spreadsheet_url(value: str) -> SpreadsheetLink:
 
 
 def validate_columns(columns: object) -> dict[str, int]:
-    if not isinstance(columns, dict) or set(columns) != set(FIELDS):
-        raise BotError("В columns нужны поля number, title, notes и url.")
+    # Старую карту из четырёх столбцов дополним по заголовкам листа при запуске.
+    if not isinstance(columns, dict) or set(columns) not in (set(FIELDS), set(FIELDS[:-1])):
+        raise BotError("В columns нужны поля number, title, notes, url и resolve.")
     if any(type(value) is not int or not 1 <= value <= 18278 for value in columns.values()):
         raise BotError("Номера столбцов должны быть целыми числами от 1 до 18278 (A–ZZZ).")
-    if len(set(columns.values())) != len(FIELDS):
+    if len(set(columns.values())) != len(columns):
         raise BotError("Каждому полю нужен отдельный столбец.")
     return dict(columns)
 
@@ -80,33 +82,25 @@ def validate_script_url(value: str) -> str:
 @dataclass
 class Config:
     spreadsheet_url: str
-    credentials_file: str = "credentials.json"
     header_row: int = 1
     columns: dict[str, int] = field(default_factory=dict)
-    # Старые конфиги без backend продолжают работать через Google API.
-    backend: str = "google"
     script_url: str = ""
     script_token: str = field(default="", repr=False)
+    leetcode_username: str = "1-andro1d-1"
 
     def __post_init__(self) -> None:
         parse_spreadsheet_url(self.spreadsheet_url)
-        if not isinstance(self.credentials_file, str) or not self.credentials_file.strip():
-            raise BotError("credentials_file должен содержать путь к JSON-ключу Google.")
         if type(self.header_row) is not int or not 1 <= self.header_row <= 1000000:
             raise BotError("header_row должен быть номером строки от 1 до 1000000.")
         # Пустая карта означает, что настройка столбцов ещё не завершена.
         if self.columns != {}:
             self.columns = validate_columns(self.columns)
-        if self.backend not in {"google", "apps_script"}:
-            raise BotError("backend должен быть google или apps_script.")
-        if self.backend == "apps_script":
-            self.script_url = validate_script_url(self.script_url)
-            if not isinstance(self.script_token, str) or not re.fullmatch(r"[a-f0-9]{64}", self.script_token):
-                raise BotError(
-                    "Нужен токен из журнала выполнения функции setup: 64 символа (цифры и буквы a–f). "
-                    "ID развёртывания и ссылка /exec не подходят. "
-                    "Для повторного ввода запустите: python bot.py --apps-script"
-                )
+        self.script_url = validate_script_url(self.script_url)
+        if not isinstance(self.script_token, str) or not re.fullmatch(r"[a-f0-9]{64}", self.script_token):
+            raise BotError("Нужен токен из журнала setup: 64 символа (цифры и буквы a–f). Для повторного ввода: python bot.py --setup")
+        from .leetcode import parse_username
+
+        self.leetcode_username = parse_username(self.leetcode_username)
 
     @property
     def link(self) -> SpreadsheetLink:
@@ -118,6 +112,9 @@ class Config:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("ожидается JSON-объект")
+            # Миграция предыдущей версии без потери подключения к Google Таблице.
+            data.pop("backend", None)
+            data.pop("credentials_file", None)
             return cls(**data)
         except (ValueError, TypeError, OSError) as error:
             raise BotError(f"Не удалось прочитать {path}: {error}. Исправьте файл или запустите --setup.") from error

@@ -1,35 +1,30 @@
-"""Консольный интерфейс на Rich."""
+"""Интерфейс: задача, difficulties и ожидание новых решений."""
 
-from __future__ import annotations
-
-from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
-from rich.table import Table
 from rich.text import Text
-from rich.theme import Theme
 
-from .config import BotError, Config, column_letter
+from .config import RESOLVE_OPTIONS
 from .leetcode import Problem
 
 
 class TerminalUI:
     def __init__(self) -> None:
-        self.console = Console(theme=Theme({"accent": "bold cyan", "good": "green", "muted": "dim", "warn": "yellow"}))
+        self.console = Console()
 
     def banner(self) -> None:
         self.console.print(Panel(
-            "[bold white]LeetCode[/bold white] [accent]→[/accent] [bold white]Google Sheets[/bold white]\n"
-            "[muted]Задача решена. Опыт сохранён.[/muted]",
-            border_style="cyan", padding=(1, 3), title="[accent]STUDY JOURNAL[/accent]",
+            "[bold white]LeetCode → Google Sheets[/bold white]\n"
+            "[dim]Решайте задачи. Записывайте только difficulties.[/dim]",
+            title="[bold cyan]SYNC JOURNAL[/bold cyan]", border_style="cyan", padding=(1, 3),
         ))
 
-    def ask(self, label: str, default: str | None = None, choices: list[str] | None = None) -> str:
-        return Prompt.ask(f"[accent]{label}[/accent]", console=self.console, default=default, choices=choices).strip()
+    def ask(self, label: str, default: str | None = None) -> str:
+        return Prompt.ask(f"[bold cyan]{label}[/bold cyan]", console=self.console, default=default).strip()
 
     def ask_secret(self, label: str) -> str:
-        return Prompt.ask(f"[accent]{label}[/accent]", console=self.console, password=True).strip()
+        return Prompt.ask(f"[bold cyan]{label}[/bold cyan]", console=self.console, password=True).strip()
 
     def error(self, message: str) -> None:
         self.console.print(Panel(Text(message), title="[red]Не получилось[/red]", border_style="red"))
@@ -46,63 +41,40 @@ class TerminalUI:
             color = {"Easy": "green", "Medium": "yellow", "Hard": "red"}.get(problem.difficulty, "white")
             text.append(f"   {problem.difficulty}", style=color)
         text.append(f"\n{problem.url}", style=f"cyan link {problem.url}")
-        self.console.print(Panel(text, border_style="cyan", padding=(1, 2)))
+        self.console.print(Panel(text, title="Принято на LeetCode • ещё нет в таблице", border_style="cyan", padding=(1, 2)))
 
     def notes(self) -> str | None:
         self.console.print(
-            "[bold]Что вызвало сложности?[/bold]\n"
-            "[muted]Можно несколько строк. Точка на отдельной строке — сохранить.\n"
-            "/skip — без заметки, /cancel — отменить задачу.[/muted]"
+            "[bold]Какие difficulties возникли в этой задаче?[/bold]\n"
+            "[dim]Несколько строк; точка на отдельной строке — сохранить.\n"
+            "/skip — сохранить без заметки; /later — отложить до следующего запуска.[/dim]"
         )
-        lines: list[str] = []
+        lines = []
         length = 0
         while True:
             line = self.console.input("[cyan]  │ [/cyan]")
             command = line.strip().lower()
-            if command == "/cancel":
+            if command == "/later":
                 return None
             if command == "/skip":
                 return ""
             if command == ".":
                 return "\n".join(lines).strip()
-            # Google ограничивает содержимое одной ячейки 50 000 символами.
-            added = len(line) + (1 if lines else 0)
+            added = len(line) + bool(lines)
             if length + added > 50000:
-                self.warning("Лимит заметки — 50 000 символов. Завершите ввод точкой или /cancel.")
+                self.warning("Лимит заметки — 50 000 символов. Завершите ввод точкой или /later.")
                 continue
             lines.append(line)
             length += added
 
-    def mapping(self, config: Config, headers: list[str]) -> None:
-        table = Table(box=box.SIMPLE, header_style="bold cyan")
-        table.add_column("Данные")
-        table.add_column("Столбец")
-        table.add_column("Заголовок")
-        labels = {"number": "Номер задачи", "title": "Название", "notes": "Мои сложности", "url": "Ссылка"}
-        for field, index in config.columns.items():
-            table.add_row(labels[field], column_letter(index), headers[index - 1] if index <= len(headers) else "—")
-        self.console.print(table)
-
-    def help(self) -> None:
-        self.console.print(Panel(
-            "[accent]228[/accent]       — добавить решённую задачу\n"
-            "[accent]/help[/accent]     — команды\n"
-            "[accent]/config[/accent]   — показать настройки\n"
-            "[accent]/draft[/accent]    — последняя локальная копия заметки\n"
-            "[accent]/exit[/accent]     — выход",
-            title="[bold]Команды[/bold]", border_style="bright_black",
-        ))
-
-    def show_draft(self, problem: Problem, notes: str) -> None:
-        self.problem(problem)
-        self.console.print(Panel(Text(notes or "Без заметки"), title="Локальная копия"))
-
-    def demo(self) -> None:
-        self.banner()
-        self.console.print("[muted]Демонстрация интерфейса • без сети и записи в Google[/muted]\n")
-        self.console.print("[accent]Номер задачи[/accent]: 228")
-        self.problem(Problem(228, "Summary Ranges", "summary-ranges", "Easy"))
-        self.console.print("[bold]Что вызвало сложности?[/bold]")
-        self.console.print(Text("  │ Граничные случаи: пустой массив и переполнение int.MAX.\n  │ .", style="cyan"))
-        self.success("Так будет выглядеть результат сохранения задачи №228.")
-        self.help()
+    def resolve_choice(self) -> str:
+        self.console.print("[bold]Resolve — нужно решить эту задачу повторно?[/bold]")
+        for index, option in enumerate(RESOLVE_OPTIONS, 1):
+            self.console.print(f"  [cyan]{index}[/cyan] — {option}")
+        answers = {str(index): option for index, option in enumerate(RESOLVE_OPTIONS, 1)}
+        answers.update({option.casefold(): option for option in RESOLVE_OPTIONS})
+        while True:
+            value = self.ask("Выберите 1, 2 или 3").casefold()
+            if value in answers:
+                return answers[value]
+            self.warning("Выберите: 1 — ДА, 2 — может быть, 3 — нет.")

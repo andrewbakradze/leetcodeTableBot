@@ -1,218 +1,227 @@
-"""Получение публичного каталога LeetCode без cookies и пароля."""
+"""История принятых решений и полный список решённых задач своего аккаунта."""
 
 from __future__ import annotations
 
 import json
 import re
-import time
-from dataclasses import asdict, dataclass
+import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+
+import requests
 
 from .config import BotError, write_json
 
-CATALOG_URL = "https://leetcode.com/api/problems/all/"
-CACHE_TTL = 24 * 60 * 60
-DIFFICULTIES = {1: "Easy", 2: "Medium", 3: "Hard"}
-MIRROR_ROOT = "https://raw.githubusercontent.com/doocs/leetcode/main"
-MIRROR_INDEX_URL = MIRROR_ROOT + "/solution/README_EN.md"
+GRAPHQL_URL = "https://leetcode.com/graphql/"
+RECENT_QUERY = """
+query JournalProfile($username: String!, $limit: Int!) {
+  matchedUser(username: $username) {
+    username submitStatsGlobal { acSubmissionNum { difficulty count } }
+  }
+  recentAcSubmissionList(username: $username, limit: $limit) { title titleSlug timestamp }
+}
+"""
+SOLVED_QUERY = """
+query JournalSolved($skip: Int!, $limit: Int!, $filters: QuestionListFilterInput) {
+  solved: questionList(categorySlug: "", skip: $skip, limit: $limit, filters: $filters) {
+    total: totalNum
+    questions: data { number: questionFrontendId title titleSlug difficulty status }
+  }
+}
+"""
+DETAIL_QUERY = """
+query JournalQuestion($slug: String!) {
+  question(titleSlug: $slug) { number: questionFrontendId title titleSlug difficulty }
+}
+"""
+
+
+def parse_username(value: str) -> str:
+    value = value.strip()
+    if "://" in value:
+        parts = urlsplit(value)
+        match = re.fullmatch(r"/(?:u/)?([A-Za-z0-9_-]+)/?", parts.path)
+        if parts.scheme != "https" or parts.netloc != "leetcode.com" or not match:
+            raise BotError("Укажите username или ссылку https://leetcode.com/u/username/.")
+        value = match.group(1)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value):
+        raise BotError("В username допустимы латинские буквы, цифры, дефис и подчёркивание.")
+    return value
 
 
 @dataclass(frozen=True)
 class Problem:
-    number: int
+    number: int | None
     title: str
     slug: str
     difficulty: str = ""
+    timestamp: int = 0
 
     @property
     def url(self) -> str:
         return f"https://leetcode.com/problems/{self.slug}/"
 
-
-def parse_problem_number(value: str) -> int:
-    value = value.strip()
-    if not re.fullmatch(r"[0-9]{1,7}", value) or int(value) < 1:
-        raise BotError("Введите положительный номер задачи, например 1 или 228.")
-    return int(value)
-
-
-def parse_problem_url(value: str) -> str:
-    """Возвращает slug из скопированной ссылки, отбрасывая вкладку и параметры."""
-    parts = urlsplit(value.strip())
-    match = re.fullmatch(r"/problems/([a-z0-9]+(?:-[a-z0-9]+)*)(?:/.*)?", parts.path)
-    if parts.scheme != "https" or parts.netloc not in {"leetcode.com", "www.leetcode.com"} or not match:
-        raise BotError("Вставьте ссылку вида https://leetcode.com/problems/two-sum/ или /cancel.")
-    return match.group(1)
-
-
-def parse_mirror_index(text: str) -> dict[int, tuple[str, str]]:
-    """Читает только номер, путь к документу и сложность из открытого каталога doocs."""
-    entries = {}
-    for line in text.splitlines():
-        match = re.match(r"^\|\s*([0-9]+)\s*\|\s*\[.+?\]\((/solution/[^)]+/README_EN\.md)\)\s*\|[^|]*\|\s*(Easy|Medium|Hard)\s*\|", line)
-        if not match:
-            continue
-        number = int(match.group(1))
-        path = unquote(match.group(2))
-        # Запросы идут только к файлам одного репозитория; внешние URL и переходы ../ не принимаются.
-        if re.fullmatch(r"/solution/[0-9]+-[0-9]+/0*" + str(number) + r"\.[^/?#]+/README_EN\.md", path):
-            entries[number] = (quote(path, safe="/"), match.group(3))
-    if not entries:
-        raise BotError("Резервный каталог задач вернул неожиданный формат.")
-    return entries
-
-
-def parse_mirror_problem(text: str, number: int, difficulty: str) -> Problem:
-    match = re.search(
-        r"^#\s+\[([0-9]+)\.\s+(.+?)\]\(https://leetcode\.com/problems/([a-z0-9]+(?:-[a-z0-9]+)*)/?\)",
-        text, re.MULTILINE,
-    )
-    if not match or int(match.group(1)) != number:
-        raise BotError("В резервном источнике не удалось проверить номер и ссылку задачи.")
-    return Problem(number, match.group(2), match.group(3), difficulty)
-
-
-def parse_catalog(payload: object) -> dict[int, Problem]:
-    if not isinstance(payload, dict) or not isinstance(payload.get("stat_status_pairs"), list):
-        raise BotError("LeetCode вернул неожиданный ответ. Попробуйте позже.")
-    problems = {}
-    for item in payload["stat_status_pairs"]:
+    @classmethod
+    def from_data(cls, data: dict) -> Problem:
+        if not isinstance(data, dict):
+            raise BotError("LeetCode вернул некорректную задачу.")
+        slug = data.get("titleSlug", data.get("slug"))
+        title = data.get("title")
+        if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+            raise BotError("LeetCode вернул некорректную ссылку задачи.")
+        if not isinstance(title, str) or not title.strip() or len(title) > 50000:
+            raise BotError("LeetCode вернул некорректное название задачи.")
+        number = data.get("number")
+        if number is not None:
+            if isinstance(number, bool) or not re.fullmatch(r"[0-9]{1,7}", str(number)) or int(number) < 1:
+                raise BotError("Поддерживаются числовые номера задач основного каталога LeetCode.")
+            number = int(number)
         try:
-            stat = item["stat"]
-            # question_id — внутренний ID; пользователь вводит frontend_question_id.
-            number = parse_problem_number(str(stat["frontend_question_id"]))
-            title = stat["question__title"]
-            slug = stat["question__title_slug"]
-            if not isinstance(title, str) or not title.strip():
-                continue
-            if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
-                continue
-            difficulty = DIFFICULTIES.get(item.get("difficulty", {}).get("level"), "")
-            problems[number] = Problem(number, title, slug, difficulty)
-        except (KeyError, TypeError, AttributeError, BotError):
-            # В каталоге встречаются задачи с нечисловыми номерами (LCP, LCR и т. п.).
-            continue
-    if not problems:
-        raise BotError("В ответе LeetCode не найдено задач с числовыми номерами.")
-    return problems
+            timestamp = int(data.get("timestamp", 0))
+        except (ValueError, TypeError) as error:
+            raise BotError("LeetCode вернул некорректное время решения.") from error
+        difficulty = data.get("difficulty", "")
+        if not isinstance(difficulty, str):
+            raise BotError("LeetCode вернул некорректную сложность задачи.")
+        return cls(number, title, slug, difficulty, timestamp)
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    problems: tuple[Problem, ...]
+    total_solved: int
+    complete: bool
 
 
 class LeetCodeClient:
-    def __init__(self, cache_file: Path) -> None:
-        self.cache_file = cache_file
-        self.problems: dict[int, Problem] = {}
-        self.fetched_at = 0.0
-        self.warning: str | None = None
-        self._primary_error: BotError | None = None
-        self._mirror_index: dict[int, tuple[str, str]] = {}
-        self._read_cache()
+    def __init__(self, username: str, state_dir: Path, *, load_session: bool = True) -> None:
+        self.username = parse_username(username)
+        self.session_file = state_dir / "leetcode_session.json"
+        self.http = requests.Session()
+        self.http.headers.update({"User-Agent": "LeetCodeTableBot/2.0", "Referer": "https://leetcode.com/"})
+        self.lock = threading.RLock()
+        self.authenticated = False
+        self.verified = False
+        self.metadata: dict[str, Problem] = {}
+        if load_session:
+            self._load_session()
 
-    def _read_cache(self) -> None:
+    def _load_session(self) -> None:
+        if not self.session_file.exists():
+            return
         try:
-            cached = json.loads(self.cache_file.read_text(encoding="utf-8"))
-            problems = parse_catalog(cached["catalog"])
-            fetched_at = float(cached["fetched_at"])
-            if not 0 < fetched_at <= time.time() + 60:
-                return
-            self.problems = problems
-            self.fetched_at = fetched_at
-        except (OSError, ValueError, TypeError, KeyError, BotError):
-            pass  # Повреждённый кеш не мешает загрузить свежие данные.
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+            if data["username"].casefold() != self.username.casefold():
+                raise BotError("Локальная сессия принадлежит другому профилю. Запустите python bot.py --login.")
+            self._set_cookies(data["session"], data["csrf"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise BotError("Не удалось прочитать сессию LeetCode. Повторите вход: python bot.py --login.") from error
 
-    def _refresh(self) -> None:
-        request = Request(CATALOG_URL, headers={
-            "User-Agent": "LeetCodeTableBot/1.0 (+local personal study journal)",
-            "Accept": "application/json",
-            "Referer": "https://leetcode.com/problemset/",
-        })
-        try:
-            with urlopen(request, timeout=25) as response:
-                payload = json.load(response)
-            self.problems = parse_catalog(payload)
-            self.fetched_at = time.time()
-        except HTTPError as error:
-            if error.code in (403, 429):
-                raise BotError(f"LeetCode ограничил запросы (HTTP {error.code}). Попробуйте позже.") from error
-            raise BotError(f"Ошибка LeetCode: HTTP {error.code}.") from error
-        except (URLError, TimeoutError, OSError) as error:
-            raise BotError("Не удалось подключиться к LeetCode. Проверьте интернет.") from error
-        except (ValueError, UnicodeError) as error:
-            raise BotError("Вместо каталога LeetCode вернул некорректный ответ.") from error
-        try:
-            write_json(self.cache_file, {"fetched_at": self.fetched_at, "catalog": payload})
-        except OSError:
-            self.warning = "Не удалось сохранить кеш LeetCode; данные загружены из сети."
+    def _set_cookies(self, session: str, csrf: str) -> None:
+        for value in (session, csrf):
+            if not isinstance(value, str) or not value or len(value) > 12000 or any(char.isspace() or char in ";\r\n" for char in value):
+                raise BotError("Скопируйте только значение cookie из браузера, без имени и без Cookie:.")
+        self.http.cookies.set("LEETCODE_SESSION", session, domain="leetcode.com", path="/", secure=True)
+        self.http.cookies.set("csrftoken", csrf, domain="leetcode.com", path="/", secure=True)
+        self.http.headers["x-csrftoken"] = csrf
+        self.authenticated = True
+        self.verified = False
 
-    def get_problem(self, number: int) -> Problem:
-        self.warning = None
-        stale = time.time() - self.fetched_at >= CACHE_TTL
-        if stale or number not in self.problems:
+    def login(self, session: str, csrf: str) -> None:
+        with self.lock:
+            self._set_cookies(session, csrf)
+            self._verify_account()
+            write_json(self.session_file, {"username": self.username, "session": session, "csrf": csrf})
+
+    def _query(self, query: str, variables: dict | None = None) -> dict:
+        with self.lock:
             try:
-                if self._primary_error is not None:
-                    raise self._primary_error
-                self._refresh()
-            except BotError as error:
-                self._primary_error = error
-                if number not in self.problems:
-                    try:
-                        problem = self._get_mirror_problem(number)
-                    except BotError:
-                        raise BotError(f"{error} Резервный источник тоже недоступен или не содержит задачу. Можно ввести название и ссылку вручную.") from error
-                    self.problems[number] = problem
-                    self.fetched_at = time.time()
-                    self._save_metadata()
-                    self.warning = "LeetCode недоступен; название и ссылка получены из открытого каталога doocs/leetcode."
-                    return problem
-                self.warning = "LeetCode недоступен; данные задачи взяты из локального кеша."
-        if number not in self.problems:
-            raise BotError(f"Задача №{number} не найдена в каталоге LeetCode. Проверьте номер.")
-        return self.problems[number]
+                response = self.http.post(GRAPHQL_URL, json={"query": query, "variables": variables or {}}, timeout=(10, 30), allow_redirects=False)
+                response.raise_for_status()
+                if response.is_redirect:
+                    raise BotError("LeetCode перенаправил запрос. Проверьте доступ к сайту и повторите позже.")
+                body = response.json()
+            except requests.HTTPError as error:
+                status = error.response.status_code if error.response is not None else "?"
+                if status in (401, 403) and self.authenticated:
+                    raise BotError(f"LeetCode не разрешил доступ к сессии (HTTP {status}). При необходимости повторите --login.") from error
+                raise BotError(f"LeetCode не отдал историю решений (HTTP {status}). Следующая проверка через минуту.") from error
+            except requests.RequestException as error:
+                raise BotError("LeetCode не отвечает. Следующая проверка через минуту.") from error
+            except ValueError as error:
+                raise BotError("LeetCode вернул страницу вместо данных. Следующая проверка через минуту.") from error
+            if not isinstance(body, dict) or body.get("errors") or not isinstance(body.get("data"), dict):
+                raise BotError("LeetCode не вернул ожидаемые данные. Проверьте профиль, доступность истории и сессию.")
+            return body["data"]
 
-    @staticmethod
-    def _download_text(url: str) -> str:
-        request = Request(url, headers={"User-Agent": "LeetCodeTableBot/1.0", "Accept": "text/plain"})
+    def _verify_account(self) -> None:
+        data = self._query("query { userStatus { username isSignedIn } }")
+        user = data.get("userStatus") or {}
+        if not isinstance(user, dict) or user.get("isSignedIn") is not True:
+            raise BotError("Сессия LeetCode истекла или недействительна. Запустите python bot.py --login.")
+        if str(user.get("username", "")).casefold() != self.username.casefold():
+            raise BotError("В браузере открыт другой аккаунт LeetCode. Нужна сессия профиля из конфига.")
+        self.verified = True
+
+    def fetch_snapshot(self) -> Snapshot:
+        if self.authenticated:
+            return self._full_snapshot()
+        data = self._query(RECENT_QUERY, {"username": self.username, "limit": 20})
+        user = data.get("matchedUser")
+        if not isinstance(user, dict):
+            raise BotError(f"Профиль {self.username} не найден на LeetCode.")
         try:
-            with urlopen(request, timeout=20) as response:
-                return response.read(5_000_000).decode("utf-8")
-        except (HTTPError, URLError, OSError, ValueError, UnicodeError) as error:
-            raise BotError("Резервный источник задач недоступен.") from error
+            stats = user["submitStatsGlobal"]["acSubmissionNum"]
+            total = next(item["count"] for item in stats if item["difficulty"] == "All")
+            raw = data["recentAcSubmissionList"]
+            if type(total) is not int or total < 0 or not isinstance(raw, list):
+                raise ValueError
+            unique = {}
+            for item in raw:
+                problem = Problem.from_data(item)
+                unique[problem.slug] = max((unique.get(problem.slug, problem), problem), key=lambda task: task.timestamp)
+        except (KeyError, TypeError, StopIteration, ValueError) as error:
+            raise BotError("Не удалось прочитать историю принятых решений LeetCode.") from error
+        problems = tuple(sorted(unique.values(), key=lambda problem: (problem.timestamp, problem.slug)))
+        return Snapshot(problems, total, len(problems) >= total)
 
-    def _get_mirror_problem(self, number: int) -> Problem:
-        if not self._mirror_index:
-            index_file = self.cache_file.with_name("doocs_index.json")
-            try:
-                cached = json.loads(index_file.read_text(encoding="utf-8"))
-                if not 0 <= time.time() - float(cached["fetched_at"]) < CACHE_TTL:
-                    raise ValueError("stale")
-                self._mirror_index = parse_mirror_index(cached["text"])
-            except (OSError, ValueError, TypeError, KeyError, AttributeError, BotError):
-                text = self._download_text(MIRROR_INDEX_URL)
-                self._mirror_index = parse_mirror_index(text)
-                try:
-                    write_json(index_file, {"fetched_at": time.time(), "text": text, "source": MIRROR_INDEX_URL})
-                except OSError:
-                    pass
-        if number not in self._mirror_index:
-            raise BotError(f"В резервном каталоге нет задачи №{number}.")
-        path, difficulty = self._mirror_index[number]
-        # Ссылку берём из заголовка документа, а не угадываем по названию задачи.
-        return parse_mirror_problem(self._download_text(MIRROR_ROOT + path), number, difficulty)
+    def _full_snapshot(self) -> Snapshot:
+        # Истёкшая сессия не должна превращаться в ложный «пустой список».
+        self._verify_account()
+        problems = {}
+        skip = 0
+        while True:
+            data = self._query(SOLVED_QUERY, {"skip": skip, "limit": 100, "filters": {"status": "AC"}})
+            result = data.get("solved")
+            if not isinstance(result, dict) or type(result.get("total")) is not int or result["total"] < 0 or not isinstance(result.get("questions"), list):
+                raise BotError("LeetCode не вернул полный список решённых задач.")
+            total = result["total"]
+            page = result["questions"]
+            for item in page:
+                if not isinstance(item, dict) or str(item.get("status", "")).lower() != "ac":
+                    raise BotError("LeetCode не подтвердил Accepted. Проверьте сессию через --login.")
+                problem = Problem.from_data(item)
+                if problem.number is None:
+                    raise BotError("В полном списке отсутствует номер задачи.")
+                problems[problem.slug] = problem
+            skip += len(page)
+            if skip >= total:
+                break
+            if not page or skip > 100000:
+                raise BotError("LeetCode вернул неполный список. Повторим сверку через минуту.")
+        if len(problems) != total:
+            raise BotError("Список задач изменился во время загрузки. Повторим сверку через минуту.")
+        return Snapshot(tuple(sorted(problems.values(), key=lambda problem: problem.number or 0)), total, True)
 
-    def _save_metadata(self) -> None:
-        levels = {value: key for key, value in DIFFICULTIES.items()}
-        catalog = {"stat_status_pairs": [
-            {"stat": {"frontend_question_id": problem.number, "question__title": problem.title,
-                      "question__title_slug": problem.slug}, "difficulty": {"level": levels.get(problem.difficulty)}}
-            for problem in self.problems.values()
-        ]}
-        try:
-            write_json(self.cache_file, {"fetched_at": self.fetched_at, "catalog": catalog})
-        except OSError:
-            pass
-
-    @staticmethod
-    def backup(path: Path, problem: Problem, notes: str) -> None:
-        write_json(path, {"problem": asdict(problem), "notes": notes})
+    def resolve(self, problem: Problem) -> Problem:
+        if problem.number is not None:
+            return problem
+        if problem.slug in self.metadata:
+            return replace(self.metadata[problem.slug], timestamp=problem.timestamp)
+        data = self._query(DETAIL_QUERY, {"slug": problem.slug})
+        resolved = Problem.from_data(data.get("question"))
+        if resolved.number is None or resolved.slug != problem.slug:
+            raise BotError("Не удалось проверить номер задачи. Она останется в очереди до следующей проверки.")
+        self.metadata[problem.slug] = resolved
+        return replace(resolved, timestamp=problem.timestamp)

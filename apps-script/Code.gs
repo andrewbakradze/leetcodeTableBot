@@ -28,12 +28,12 @@ function doPost(event) {
     const properties = PropertiesService.getScriptProperties();
     const token = properties.getProperty('BOT_TOKEN');
     if (!token || typeof request.token !== 'string' || request.token !== token) {
-      return jsonReply_({ ok: false, error: 'Неверный токен. Скопируйте токен из журнала setup и запустите бота с --apps-script.' });
+      return jsonReply_({ ok: false, error: 'Неверный токен. Скопируйте токен из журнала setup и запустите бота с --setup.' });
     }
     const spreadsheetId = properties.getProperty('SPREADSHEET_ID');
     require_(spreadsheetId && request.spreadsheet_id === spreadsheetId,
       'Ссылка бота указывает на другую таблицу. Запустите setup в Apps Script нужной таблицы.');
-    const actions = ['metadata', 'read', 'initialize', 'append', 'add_notes'];
+    const actions = ['metadata', 'read', 'initialize', 'append'];
     require_(actions.includes(request.action), 'Неизвестная команда.');
     // Блокировка сериализует изменения от нескольких экземпляров бота.
     const lock = LockService.getScriptLock();
@@ -59,52 +59,58 @@ function doPost(event) {
 }
 
 function handleRequest_(sheet, request) {
-  if (request.action === 'metadata') return { title: sheet.getName(), col_count: sheet.getMaxColumns() };
+  if (request.action === 'metadata') return { title: sheet.getName(), col_count: sheet.getMaxColumns(), supports_resolve: true };
   if (request.action === 'read') return { rows: sheet.getDataRange().getDisplayValues() };
   if (request.action === 'initialize') {
     const rows = sheet.getDataRange().getDisplayValues();
     require_(!rows.some(row => row.some(cell => cell.trim())), 'В листе уже есть данные. Настройте столбцы.');
-    if (sheet.getMaxColumns() < 4) sheet.insertColumnsAfter(sheet.getMaxColumns(), 4 - sheet.getMaxColumns());
-    sheet.getRange(1, 1, 1, 4).setValues([['problem number', 'problem name', 'my difficulties', 'link']]);
+    if (sheet.getMaxColumns() < 5) sheet.insertColumnsAfter(sheet.getMaxColumns(), 5 - sheet.getMaxColumns());
+    sheet.getRange(1, 1, 1, 5).setValues([['problem number', 'problem name', 'my difficulties', 'link', 'Resolve']]);
     return {};
   }
-  const fields = ['number', 'title', 'notes', 'url'];
+  const fields = ['number', 'title', 'notes', 'url', 'resolve'];
   const columns = request.columns;
   require_(columns && typeof columns === 'object' && !Array.isArray(columns) &&
-    Object.keys(columns).length === 4 && fields.every(field => Number.isInteger(columns[field]) &&
+    Object.keys(columns).length === fields.length && fields.every(field => Number.isInteger(columns[field]) &&
     columns[field] >= 1 && columns[field] <= sheet.getMaxColumns()) &&
-    new Set(fields.map(field => columns[field])).size === 4, 'Некорректные столбцы. Запустите --setup.');
+    new Set(fields.map(field => columns[field])).size === fields.length, 'Некорректные столбцы. Проверьте заголовок Resolve.');
   require_(Number.isInteger(request.header_row) && request.header_row >= 1 &&
     request.header_row <= sheet.getMaxRows(), 'Некорректная строка заголовков.');
   require_(Number.isInteger(request.number) && request.number >= 1 && request.number <= 9999999, 'Некорректный номер задачи.');
   require_(typeof request.notes === 'string' && request.notes.length <= 50000, 'Лимит заметки — 50 000 символов.');
+  require_(['ДА', 'может быть', 'нет'].includes(request.resolve), 'Resolve: выберите ДА, может быть или нет.');
   if (request.action === 'append') {
     require_(typeof request.title === 'string' && request.title.trim() && request.title.length <= 50000, 'Некорректное название задачи.');
     require_(typeof request.url === 'string' && /^https:\/\/leetcode\.com\/problems\/[a-z0-9]+(?:-[a-z0-9]+)*\/$/.test(request.url), 'Некорректная ссылка LeetCode.');
     const row = Math.max(sheet.getLastRow() + 1, request.header_row + 1);
     if (row > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), row - sheet.getMaxRows());
+    const resolveValue = resolveText_(sheet.getRange(row, columns.resolve), request.resolve);
     const width = Math.max(...fields.map(field => columns[field]));
     const values = Array.from({ length: width }, () => literalText_(''));
     fields.forEach(field => {
       // RichTextValue записывает текст буквально, в том числе строки, начинающиеся с '='.
-      values[columns[field] - 1] = literalText_(String(request[field]), field === 'title' || field === 'url' ? request.url : null);
+      const text = field === 'resolve' ? resolveValue : String(request[field]);
+      values[columns[field] - 1] = literalText_(text, field === 'title' || field === 'url' ? request.url : null);
     });
     sheet.getRange(row, 1, 1, width).setRichTextValues([values]);
     sheet.getRange(row, columns.number).setValue(request.number);
     return { row: row };
   }
-  require_(Number.isInteger(request.row) && request.row > request.header_row &&
-    request.row <= sheet.getLastRow(), 'Строка задачи изменилась. Введите номер заново; заметка есть в /draft.');
-  const actualNumber = sheet.getRange(request.row, columns.number).getDisplayValue().trim();
-  require_(/^[0-9]+(?:[.,]0+)?$/.test(actualNumber) &&
-    Number(actualNumber.replace(',', '.')) === request.number,
-    'Строка задачи изменилась. Введите номер заново; заметка есть в /draft.');
-  const cell = sheet.getRange(request.row, columns.notes);
-  const current = cell.getDisplayValue();
-  const combined = current ? current + '\n\n' + request.notes : request.notes;
-  require_(combined.length <= 50000, 'Заметка вместе с предыдущей превышает 50 000 символов.');
-  cell.setRichTextValue(literalText_(combined));
-  return { row: request.row };
+}
+
+function resolveText_(cell, value) {
+  const rule = cell.getDataValidation();
+  if (!rule) return value;
+  const type = rule.getCriteriaType();
+  const criteria = SpreadsheetApp.DataValidationCriteria;
+  let options;
+  if (type === criteria.VALUE_IN_LIST) options = rule.getCriteriaValues()[0];
+  else if (type === criteria.VALUE_IN_RANGE) options = rule.getCriteriaValues()[0].getDisplayValues().flat();
+  else return value;
+  // Сохраняем написание уже настроенного списка, например «Нет» вместо «нет».
+  const match = options.find(option => String(option).trim().toLowerCase() === value.toLowerCase());
+  require_(match !== undefined, 'В списке Resolve нет выбранного варианта. Нужны ДА, может быть и нет.');
+  return String(match);
 }
 
 function literalText_(text, url) {
